@@ -7,6 +7,7 @@ import * as winston from 'winston';
 import { PdfModule } from './pdf/pdf.module';
 import { DifyModule } from './dify/dify.module';
 import { DatabaseModule } from './database/database.module';
+import { OpenSearchModule } from './opensearch/opensearch.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -50,6 +51,9 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 
     // 数据库模块
     DatabaseModule,
+    
+    // OpenSearch模块
+    OpenSearchModule,
     
     // 业务模块
     PdfModule,
