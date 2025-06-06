@@ -1,4 +1,4 @@
-import { Injectable, Inject } from '@nestjs/common';
+import { Injectable, Inject, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Like } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
@@ -9,7 +9,10 @@ import { PdfDocument } from '../../database/entities/pdf-document.entity';
 import { TextSegment } from '../../database/entities/text-segment.entity';
 import { 
   KnowledgeBaseQueryDto,
-  DifyKnowledgeBaseResponseDto 
+  DifyKnowledgeBaseResponseDto,
+  DifyRetrievalRequestDto,
+  DifyRetrievalResponseDto,
+  DifyRetrievalRecordDto,
 } from '../dto/dify.dto';
 
 @Injectable()
@@ -354,5 +357,155 @@ export class DifyKnowledgeBaseService {
     const lengthFactor = Math.min(1, 1000 / text.length);
     
     return basicScore * 0.8 + lengthFactor * 0.2;
+  }
+
+  /**
+   * 执行Dify外部知识库检索
+   */
+  async performRetrieval(
+    dto: DifyRetrievalRequestDto,
+  ): Promise<DifyRetrievalResponseDto> {
+    this.logger.info('执行Dify外部知识库检索', {
+      knowledge_id: dto.knowledge_id,
+      query: dto.query,
+      top_k: dto.retrieval_setting.top_k,
+      score_threshold: dto.retrieval_setting.score_threshold,
+    });
+
+    // 验证知识库是否存在
+    await this.validateKnowledgeBase(dto.knowledge_id);
+
+    try {
+      // 执行文本搜索
+      const searchResults = await this.searchTextSegments(
+        dto.query,
+        dto.retrieval_setting.top_k,
+        dto.retrieval_setting.score_threshold,
+        dto.metadata_condition,
+      );
+
+      // 转换为Dify格式的响应
+      const records: DifyRetrievalRecordDto[] = searchResults.map(segment => ({
+        content: segment.content,
+        score: this.calculateSimilarity(segment.content, dto.query),
+        title: segment.document?.title || `文档片段 ${segment.segmentIndex}`,
+        metadata: {
+          document_id: segment.documentId,
+          segment_index: segment.segmentIndex,
+          start_page: segment.startPage,
+          end_page: segment.endPage,
+          segmentation_type: segment.segmentationType,
+          word_count: segment.wordCount,
+          character_count: segment.characterCount,
+          path: segment.document?.filePath || '',
+          created_at: segment.createdAt?.toISOString(),
+          ...segment.metadata,
+        },
+      }));
+
+      // 按相似度分数过滤和排序
+      const filteredRecords = records
+        .filter(record => record.score >= dto.retrieval_setting.score_threshold)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, dto.retrieval_setting.top_k);
+
+      return {
+        records: filteredRecords,
+      };
+
+    } catch (error) {
+      this.logger.error('检索过程中发生错误', {
+        error: error.message,
+        knowledge_id: dto.knowledge_id,
+        query: dto.query,
+      });
+
+      throw new HttpException(
+        {
+          error_code: 500,
+          error_msg: '检索过程中发生内部错误'
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
+  }
+
+  /**
+   * 验证知识库是否存在
+   */
+  private async validateKnowledgeBase(knowledgeId: string): Promise<void> {
+    // 这里可以实现知识库存在性验证
+    // 目前简单验证是否有相关的文档数据
+    
+    const documentCount = await this.pdfDocumentRepository.count();
+    
+    if (documentCount === 0) {
+      throw new HttpException(
+        {
+          error_code: 2001,
+          error_msg: '知识库不存在'
+        },
+        HttpStatus.NOT_FOUND
+      );
+    }
+  }
+
+  /**
+   * 搜索文本分段（支持元数据过滤）
+   */
+  private async searchTextSegments(
+    query: string,
+    topK: number,
+    scoreThreshold: number,
+    metadataCondition?: any,
+  ): Promise<TextSegment[]> {
+    const queryBuilder = this.textSegmentRepository
+      .createQueryBuilder('segment')
+      .leftJoinAndSelect('segment.document', 'document')
+      .where('segment.content LIKE :query', { query: `%${query}%` });
+
+    // 应用元数据过滤条件
+    if (metadataCondition?.conditions) {
+      this.applyMetadataFilters(queryBuilder, metadataCondition);
+    }
+
+    // 限制结果数量（实际项目中应该使用向量搜索）
+    const results = await queryBuilder
+      .orderBy('segment.createdAt', 'DESC')
+      .limit(topK * 2) // 获取更多结果用于后续过滤
+      .getMany();
+
+    return results;
+  }
+
+  /**
+   * 应用元数据过滤条件
+   */
+  private applyMetadataFilters(queryBuilder: any, metadataCondition: any): void {
+    const { logical_operator = 'and', conditions } = metadataCondition;
+    
+    conditions.forEach((condition: any, index: number) => {
+      const { name, comparison_operator, value } = condition;
+      const paramName = `metaValue${index}`;
+      
+      // 这里简化处理，实际项目中需要根据具体的元数据结构来实现
+      switch (comparison_operator) {
+        case 'contains':
+          if (logical_operator === 'and') {
+            queryBuilder.andWhere(`segment.metadata::text LIKE :${paramName}`, { [paramName]: `%${value}%` });
+          } else {
+            queryBuilder.orWhere(`segment.metadata::text LIKE :${paramName}`, { [paramName]: `%${value}%` });
+          }
+          break;
+        case 'is':
+          if (logical_operator === 'and') {
+            queryBuilder.andWhere(`segment.metadata->>'${name[0]}' = :${paramName}`, { [paramName]: value });
+          } else {
+            queryBuilder.orWhere(`segment.metadata->>'${name[0]}' = :${paramName}`, { [paramName]: value });
+          }
+          break;
+        // 可以根据需要添加更多操作符
+      }
+    });
   }
 }
